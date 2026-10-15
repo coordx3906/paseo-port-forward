@@ -71,6 +71,30 @@ describe("Windows SSH sessions", () => {
     expect(session.running).toBe(false);
   });
 
+  it("isolates a failed forward from the host and notifies only its rule", async () => {
+    const host = child();
+    const tunnel = child();
+    spawn.mockReturnValueOnce(host).mockReturnValueOnce(tunnel);
+    const session = new WindowsHostSession("host", "my-alias");
+    const starting = session.start();
+    await spawnReady();
+    host.stdout.write("paseo-port-forward-ready\n");
+    await starting;
+    const exited = vi.fn();
+    const forwardExited = vi.fn();
+    session.onExit(exited);
+    session.onForwardExit(forwardExited);
+    const forwarding = session.forward(3000, "127.0.0.1", 3000);
+    tunnel.stdout.write("paseo-port-forward-ready\n");
+    await forwarding;
+    tunnel.emit("close", 255);
+    expect(exited).not.toHaveBeenCalled();
+    expect(forwardExited).toHaveBeenCalledOnce();
+    expect(host.stdin.writableEnded).toBe(false);
+    expect(session.running).toBe(true);
+    await session.stop();
+  });
+
   it("rejects a failed bind without tearing down the host connection", async () => {
     const host = child();
     const tunnel = child();

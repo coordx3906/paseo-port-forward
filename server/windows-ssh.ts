@@ -3,8 +3,9 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync, rmdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { forwardSpec, runSsh, sshError } from "./ssh-command";
+import { runSsh, sshError } from "./ssh-command";
 import { readSshConfiguration, type SshConfiguration } from "./ssh-config";
+import { tunnelKey, tunnelSpec, type Tunnel } from "../shared/rules";
 
 const SSH_OPTIONS = [
   "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
@@ -36,12 +37,18 @@ export class WindowsHostSession {
   private exitListeners = new Set<(error: string) => void>();
   private stopping = false;
   private configDir: string | null = null;
+  private forwardExitListeners = new Set<(key: string, error: string) => void>();
 
   private get options(): string[] {
     return ["-F", join(this.configDir!, "config"), ...SSH_OPTIONS];
   }
 
   constructor(readonly serverId: string, readonly target: string, private configuration?: SshConfiguration) {}
+
+  onForwardExit(listener: (key: string, error: string) => void): () => void {
+    this.forwardExitListeners.add(listener);
+    return () => this.forwardExitListeners.delete(listener);
+  }
 
   get running(): boolean {
     return this.connection !== null;
@@ -85,9 +92,12 @@ export class WindowsHostSession {
         else if (!this.stopping && this.connection === child) {
           this.killNow();
           for (const listener of this.exitListeners) listener(error);
-        } else if (!this.stopping && [...this.forwards.values()].includes(child)) {
-          this.killNow();
-          for (const listener of this.exitListeners) listener(error);
+        } else if (!this.stopping) {
+          for (const [key, forward] of this.forwards) {
+            if (forward !== child) continue;
+            this.forwards.delete(key);
+            for (const listener of this.forwardExitListeners) listener(key, error);
+          }
         }
       };
       child.once("error", (error) => failed(error.message));
@@ -122,9 +132,14 @@ export class WindowsHostSession {
   }
 
   async forward(localPort: number, connectHost: string, remotePort: number): Promise<void> {
-    const key = forwardSpec(localPort, connectHost, remotePort);
+    return this.forwardRule(legacyTunnel(localPort, connectHost, remotePort));
+  }
+
+  async forwardRule(tunnel: Tunnel): Promise<void> {
+    const key = tunnelKey(tunnel);
     if (this.forwards.has(key)) return;
-    const pending = this.launch(["-L", key]);
+    const pending = this.launch(["-o", `AddressFamily=${tunnel.addressFamily}`,
+      tunnel.direction === "local" ? "-L" : "-R", tunnelSpec(tunnel)]);
     this.forwards.set(key, pending.child);
     try {
       await pending.ready;
@@ -136,7 +151,11 @@ export class WindowsHostSession {
   }
 
   async cancel(localPort: number, connectHost: string, remotePort: number): Promise<void> {
-    const key = forwardSpec(localPort, connectHost, remotePort);
+    return this.cancelRule(legacyTunnel(localPort, connectHost, remotePort));
+  }
+
+  async cancelRule(tunnel: Tunnel): Promise<void> {
+    const key = tunnelKey(tunnel);
     const child = this.forwards.get(key);
     if (!child) return;
     this.forwards.delete(key);
@@ -173,4 +192,10 @@ export class WindowsHostSession {
     rmdirSync(this.configDir);
     this.configDir = null;
   }
+}
+
+function legacyTunnel(localPort: number, connectHost: string, remotePort: number): Tunnel {
+  return { direction: "local", bindAddress: "127.0.0.1", listenPort: localPort,
+    connectHost: connectHost.replace(/^\[|\]$/g, ""), connectPort: remotePort,
+    gatewayPorts: false, addressFamily: "any" };
 }

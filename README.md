@@ -18,6 +18,32 @@ The plugin runs only on your laptop's Paseo daemon. It reaches remote hosts over
 
 Settings → Plugins → **Port forwarding** has the SSH targets, auto-forward, the ignore list and the auto-forward poll interval.
 
+## Manual ports and SSH configuration
+
+Use **Add port** for services started outside Paseo. Enter a remote port and optionally
+a local port and name. Manual entries are saved and restored when the plugin restarts;
+they remain listed even when the service is not found by the Paseo process scan.
+Stop keeps the entry disabled, while Delete removes it.
+
+Static TCP `LocalForward` and `RemoteForward` rules for each configured SSH target are
+loaded automatically using `ssh -G`. **Refresh SSH config** applies additions and
+removals. The plugin preserves bind addresses and direction, and displays unsupported
+rules individually. Dynamic SOCKS and Unix socket forwards are not supported.
+
+Each source can be stopped separately. Identical enabled mappings share one tunnel;
+removing one source does not stop the remaining sources. SSH settings are read-only:
+port overrides and disabled states are stored only in the plugin.
+
+An automatically selected local port moves to the next available port when occupied.
+Explicit local ports and imported ports report conflicts instead; **Use available port**
+or **Change port** lets you change the mapping. One failed rule does not stop other
+forwards. Reverse rules show the requested remote bind, whose actual scope is subject
+to the SSH server's policy. An active tunnel does not guarantee application health.
+
+Plugin-created connections and ProxyJump hops do not inherit static forwards.
+Explicit ProxyCommand commands are preserved; commands they start manage their own
+SSH configuration and forwarding behavior.
+
 Requirements:
 - Paseo `>=0.11.1`.
 - A macOS, Linux or Windows laptop with OpenSSH (`ssh` on PATH).
@@ -41,8 +67,8 @@ Laptop daemon
   - anything under a plugin-host process.
 
   Each port carries the process, command line, `PASEO_AGENT_ID` and `PASEO_AGENT_CWD` from its environment. Terminal processes have no agent id and show their working directory instead.
-- **Forwarding** binds locally to `127.0.0.1` only. Wildcard and loopback remote binds connect to `127.0.0.1` (IPv4) or `localhost` (`::`). Specific addresses are used as-is.
-- **Auto-forward** forwards every new port on every host with an SSH target, minus the ignore list (default `22, 5432, 6379`). It removes the forward when the remote port closes. Manual forwards are kept and shown as "closed on remote" until you stop them.
+- **Forwarding** for detected and manually added ports binds locally to `127.0.0.1`. Imported SSH rules retain their requested bind and direction. Detected wildcard and loopback remote binds connect to `127.0.0.1` (IPv4) or `localhost` (`::`); specific addresses are used as-is.
+- **Auto-forward** forwards every new detected port on every host with an SSH target, minus the ignore list (default `22, 5432, 6379`). Closing a detected port removes only its detected source; saved manual and SSH rules remain.
 - **Reconnect:** if the master dies, it reconnects with backoff (1 s up to 30 s) and reapplies the forwards on the same local ports.
 - **Cleanup:**
   - Disabling or reloading the plugin cancels all forwards and closes the masters.
@@ -52,14 +78,19 @@ Laptop daemon
 
 ### Windows
 
-Windows uses OpenSSH without ControlMaster or a local Unix shell. It keeps one
-connection for the host and one per forwarded port; scans use separate SSH commands.
-A Node watchdog terminates SSH when the plugin's stdin pipe closes. If a persistent
-connection exits, the host reconnects and reapplies its forwards.
+Windows uses the built-in OpenSSH client without ControlMaster or a local Unix shell.
+It keeps one SSH connection for the host and one per forwarded port; scans use separate
+SSH commands. Each persistent connection runs under a Node watchdog that terminates
+SSH when the plugin's stdin pipe closes, including after a plugin crash. A failed
+connection reconnects through the same mechanism as on macOS/Linux.
 
-The target's effective SSH configuration is resolved once per session, including
-ProxyJump hops, and inherited forwards are removed from plugin-created connections.
-Your SSH configuration is not edited.
+Enable Windows' **OpenSSH Client** optional feature and make sure `ssh` is on the
+daemon's PATH. Keys, the SSH agent and `%USERPROFILE%\.ssh\config` work as usual.
+The remote host must still run Linux.
+
+The plugin resolves the target's effective SSH configuration once per session and
+removes inherited `LocalForward`, `RemoteForward` and `DynamicForward` entries.
+Only the ports selected in Paseo are forwarded; your SSH configuration is not edited.
 
 ## Phase 0 findings (Paseo 0.11.1)
 
@@ -79,6 +110,11 @@ npm install
 npm run typecheck
 npm test
 ```
+
+On Windows, set `PASEO_SSH_TEST_TARGET` to a Linux SSH alias before `npm test` to
+include the integration test. It requires Python 3 on the remote, starts a temporary
+HTTP server in memory, and checks HTTP forwarding in both directions, cancellation
+and listener release without changing remote files or settings.
 
 `server/fixtures/linux-scan.txt` is real scan output from a Linux container running Paseo 0.11.1, with a terminal-started server, an agent-tagged server, and an unrelated server that must be excluded.
 

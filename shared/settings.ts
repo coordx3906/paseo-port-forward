@@ -1,5 +1,6 @@
 import { defineSettings } from "@getpaseo/plugin";
 import { z } from "zod";
+import { ManualRuleSchema, RuleOverrideSchema } from "./rules";
 
 export const DEFAULT_IGNORE_PORTS = [22, 5432, 6379];
 
@@ -10,6 +11,8 @@ export const PortSettingsSchema = z.object({
   ignorePorts: z.array(z.number().int().min(1).max(65535)).default(DEFAULT_IGNORE_PORTS),
   /** Background scan interval while auto-forwarding, in seconds. */
   pollSeconds: z.number().int().min(1).max(60).default(5),
+  manualRules: z.array(ManualRuleSchema).default([]),
+  ruleOverrides: z.record(z.string(), RuleOverrideSchema).default({}),
 });
 
 export type PortSettings = z.output<typeof PortSettingsSchema>;

@@ -1,62 +1,74 @@
-/**
- * Per-host state: the SSH master, the last scan, and active forwards. Everything here
- * stays in this daemon's memory and is never sent to a remote host.
- */
 import type { Forward, PortsState, RemotePort, SshStatus } from "../shared/contracts";
 import { defaultPortSettings, type PortSettings } from "../shared/settings";
-import { pickLocalPort } from "./local-port";
-import { analyzeScan, parseScanOutput, SCAN_SCRIPT } from "./scan";
+import { effectiveBind, tunnelKey, type Rule, type Tunnel } from "../shared/rules";
+import { isLocalPortFree } from "./local-port";
+import { analyzeScan, parsePidFile, parseScanOutput, SCAN_SCRIPT } from "./scan";
 import { HostSession } from "./ssh";
+import { readSshConfiguration, type SshConfiguration } from "./ssh-config";
 
-/** A scan younger than this answers `state` without touching the remote. */
-const SCAN_FRESH_MS = 1_500;
-/** After a failed scan or connect, wait this long before trying again on a `state` call. */
-const ERROR_RETRY_MS = 5_000;
-/** Close a master nobody has looked at for this long, unless it carries forwards. */
-const IDLE_MS = 120_000;
-const MAX_BACKOFF_MS = 30_000;
+const IDENTITY_SCRIPT = 'PH="$PASEO_HOME"; [ -n "$PH" ] || PH="$HOME/.paseo"; cat "$PH/paseo.pid"';
 
+interface Instance {
+  tunnel: Tunnel;
+  refs: Map<string, string>;
+  status: "connecting" | "active" | "error";
+  error: string | null;
+  portConflict: boolean;
+}
 interface HostEntry {
   serverId: string;
   session: HostSession | null;
+  configuration: SshConfiguration | null;
   ssh: SshStatus;
   ports: RemotePort[];
+  rules: Map<string, Rule>;
+  instances: Map<string, Instance>;
+  detected: Set<number>;
+  suppressed: Set<number>;
   scannedAt: number | null;
   scanError: string | null;
-  scanning: Promise<void> | null;
+  configError: string | null;
   connecting: Promise<void> | null;
-  forwards: Map<number, Forward>;
-  lastTouched: number;
-  backoffMs: number;
+  scanning: Promise<void> | null;
+  syncing: Promise<void> | null;
+  closing: Set<Promise<void>>;
+  revision: number;
+  generation: number;
   reconnectTimer: NodeJS.Timeout | null;
+  backoffMs: number;
+  lastTouched: number;
 }
 
 export class PortManager {
   private hosts = new Map<string, HostEntry>();
-  private settings: PortSettings = defaultPortSettings();
-  private timers: NodeJS.Timeout[] = [];
-  private autoTimer: NodeJS.Timeout | null = null;
+  private settings = defaultPortSettings();
   private disposed = false;
-  private ticking = false;
+  private timer: NodeJS.Timeout;
 
   constructor(private readonly log: (message: string) => void = console.log) {
-    this.timers.push(setInterval(() => void this.reapIdle(), 15_000));
-    this.scheduleTick();
+    this.timer = setInterval(() => void this.tick(), 5_000);
   }
 
   applySettings(settings: PortSettings): void {
-    const previous = this.settings;
     this.settings = settings;
-    for (const entry of this.hosts.values()) {
-      const target = settings.targets[entry.serverId]?.trim() || null;
+    clearInterval(this.timer);
+    this.timer = setInterval(() => void this.tick(), settings.pollSeconds * 1000);
+    for (const id of new Set([...this.hosts.keys(), ...Object.keys(settings.targets)])) {
+      const entry = this.entry(id);
+      const target = settings.targets[id]?.trim() || null;
       if (target !== entry.ssh.target) {
-        this.log(`[port-forward] target for ${entry.serverId} changed to ${target ?? "(none)"}`);
-        void this.closeHost(entry, target === null ? "unmapped" : "idle");
-        entry.ssh = { ...entry.ssh, target, state: target ? "idle" : "unmapped", error: null };
+        entry.ssh.target = target;
+        entry.configuration = null;
+        entry.detected.clear();
+        entry.suppressed.clear();
+        entry.ports = [];
+        this.updateRules(entry);
+        void this.closeSession(entry).then(() => this.synchronize(entry)).catch((error) => this.hostError(entry, error));
+      } else {
+        this.updateRules(entry);
+        void this.synchronize(entry).catch((error) => this.hostError(entry, error));
       }
     }
-    if (previous.pollSeconds !== settings.pollSeconds) this.scheduleTick();
-    if (!previous.autoForward && settings.autoForward) void this.tick();
   }
 
   private entry(serverId: string): HostEntry {
@@ -64,337 +76,404 @@ export class PortManager {
     if (!entry) {
       const target = this.settings.targets[serverId]?.trim() || null;
       entry = {
-        serverId,
-        session: null,
-        ssh: {
-          state: target ? "idle" : "unmapped",
-          target,
-          error: null,
-          remoteServerId: null,
-        },
-        ports: [],
-        scannedAt: null,
-        scanError: null,
-        scanning: null,
-        connecting: null,
-        forwards: new Map(),
-        lastTouched: Date.now(),
-        backoffMs: 1_000,
-        reconnectTimer: null,
+        serverId, session: null, configuration: null,
+        ssh: { state: target ? "idle" : "unmapped", target, error: null, remoteServerId: null },
+        ports: [], rules: new Map(), instances: new Map(), detected: new Set(), suppressed: new Set(),
+        scannedAt: null, scanError: null, configError: null,
+        connecting: null, scanning: null, syncing: null, closing: new Set(), revision: 0, generation: 0,
+        reconnectTimer: null, backoffMs: 1000, lastTouched: Date.now(),
       };
       this.hosts.set(serverId, entry);
     }
     return entry;
   }
 
+  private hostError(entry: HostEntry, error: unknown): void {
+    if (this.disposed) return;
+    entry.ssh.state = entry.ssh.target ? "error" : "unmapped";
+    entry.ssh.error = message(error);
+    for (const rule of entry.rules.values()) {
+      if (rule.enabled && rule.tunnel) { rule.status = "error"; rule.error = message(error); }
+    }
+    this.scheduleReconnect(entry);
+  }
+
   private ensureConnected(entry: HostEntry): Promise<void> {
-    const target = entry.ssh.target;
-    if (!target) return Promise.reject(new Error("No SSH target configured for this host"));
-    if (entry.session?.running && entry.ssh.state === "connected") return Promise.resolve();
     if (entry.connecting) return entry.connecting;
-    const session = new HostSession(entry.serverId, target);
-    entry.session = session;
-    entry.ssh = { ...entry.ssh, state: "connecting", error: null };
-    entry.connecting = session
-      .start()
-      .then(async () => {
-        if (this.disposed) {
-          await session.stop();
-          return;
-        }
-        entry.ssh = { ...entry.ssh, state: "connected", error: null };
-        entry.backoffMs = 1_000;
-        session.onExit((error) => this.onMasterExit(entry, session, error));
-        this.log(`[port-forward] connected to ${target} for ${entry.serverId}`);
-        await this.reapplyForwards(entry);
-      })
-      .catch((error: unknown) => {
-        entry.session = null;
-        entry.ssh = { ...entry.ssh, state: "error", error: message(error) };
+    if (entry.session?.running && entry.ssh.state === "connected") return Promise.resolve();
+    const target = entry.ssh.target;
+    const generation = entry.generation;
+    if (!target) return Promise.reject(new Error("No SSH target configured"));
+    entry.ssh.state = "connecting";
+    entry.ssh.error = null;
+    const pending = (async () => {
+      const configuration = entry.configuration ?? await readSshConfiguration(target);
+      if (this.disposed || entry.ssh.target !== target || entry.generation !== generation) throw new Error("SSH target changed");
+      const session = new HostSession(entry.serverId, target, configuration);
+      entry.session = session;
+      try {
+        await session.start();
+        const pidFile = parsePidFile(await session.exec(IDENTITY_SCRIPT));
+        if (pidFile?.serverId !== entry.serverId) throw new Error(
+          `SSH target reports Paseo host ${pidFile?.serverId ?? "unknown"}, expected ${entry.serverId}`,
+        );
+        if (this.disposed || entry.session !== session || entry.ssh.target !== target || entry.generation !== generation) throw new Error("SSH session was stopped");
+        entry.configuration = configuration;
+        entry.configError = null;
+        entry.ssh = { ...entry.ssh, state: "connected", error: null, remoteServerId: pidFile.serverId };
+        entry.backoffMs = 1000;
+        session.onExit((error) => {
+          if (entry.session !== session || this.disposed) return;
+          entry.session = null;
+          entry.instances.clear();
+          this.hostError(entry, `Connection lost: ${error}`);
+        });
+        session.onForwardExit((key, error) => {
+          const instance = entry.instances.get(key);
+          if (!instance || entry.session !== session) return;
+          instance.status = "error";
+          instance.error = error;
+          this.projectInstances(entry);
+        });
+        this.updateRules(entry);
+        for (const rule of entry.rules.values()) if (rule.tunnel) { rule.status = "stopped"; rule.error = null; rule.portConflict = false; }
+      } catch (error) {
+        if (entry.session === session) entry.session = null;
+        await session.stop();
         throw error;
-      })
-      .finally(() => {
-        entry.connecting = null;
-      });
+      }
+    })();
+    entry.connecting = pending.finally(() => { entry.connecting = null; });
     return entry.connecting;
   }
 
-  private onMasterExit(entry: HostEntry, session: HostSession, error: string): void {
-    if (entry.session !== session || this.disposed) return;
-    entry.session = null;
-    entry.ssh = { ...entry.ssh, state: "error", error: `Connection lost: ${error}` };
-    for (const forward of entry.forwards.values()) {
-      forward.status = "error";
-      forward.error = "SSH connection lost; reconnecting";
-    }
-    this.log(`[port-forward] master for ${entry.serverId} exited: ${error}`);
-    if (entry.forwards.size > 0 || this.settings.autoForward) this.scheduleReconnect(entry);
-  }
-
   private scheduleReconnect(entry: HostEntry): void {
-    if (entry.reconnectTimer || this.disposed) return;
+    if (this.disposed || entry.reconnectTimer || !entry.ssh.target) return;
+    if (entry.configuration && ![...entry.rules.values()].some((rule) => rule.enabled) && !this.settings.autoForward) return;
     const delay = entry.backoffMs;
-    entry.backoffMs = Math.min(entry.backoffMs * 2, MAX_BACKOFF_MS);
+    entry.backoffMs = Math.min(delay * 2, 30_000);
     entry.reconnectTimer = setTimeout(() => {
       entry.reconnectTimer = null;
-      this.ensureConnected(entry).catch(() => this.scheduleReconnect(entry));
+      void this.synchronize(entry).catch((error) => this.hostError(entry, error));
     }, delay);
   }
 
-  private async reapplyForwards(entry: HostEntry): Promise<void> {
-    for (const forward of entry.forwards.values()) {
-      try {
-        await entry.session?.forward(forward.localPort, forward.connectHost, forward.remotePort);
-        forward.status = "active";
-        forward.error = null;
-      } catch (error) {
-        forward.status = "error";
-        forward.error = message(error);
+  private updateRules(entry: HostEntry): void {
+    const rules = new Map<string, Rule>();
+    const add = (rule: Rule) => {
+      const previous = entry.rules.get(rule.id);
+      if (previous && signature(previous) === signature(rule)) {
+        rule.actualPort = previous.actualPort;
+        rule.status = rule.enabled ? previous.status : "stopped";
+        rule.error = previous.error;
+        rule.portConflict = previous.portConflict;
+      }
+      rules.set(rule.id, rule);
+    };
+    for (const manual of this.settings.manualRules.filter((rule) => rule.serverId === entry.serverId)) {
+      add(makeRule(manual.id, "manual", manual.name || `Port ${manual.remotePort}`, manual.enabled,
+        localTunnel(manual.localPort ?? manual.remotePort, "127.0.0.1", manual.remotePort), manual.localPort === null));
+    }
+    for (const config of entry.configuration?.rules ?? []) {
+      const id = `ssh:${entry.serverId}:${entry.ssh.target}:${config.id}`;
+      const override = this.settings.ruleOverrides[id];
+      const tunnel = config.tunnel ? { ...config.tunnel, listenPort: override?.listenPort ?? config.tunnel.listenPort } : null;
+      const rule = makeRule(id, "ssh", "SSH config", override?.enabled ?? true, tunnel, false);
+      rule.requestedPort = config.tunnel?.listenPort ?? null;
+      rule.raw = config.raw;
+      rule.error = config.error;
+      rule.status = config.error ? "error" : rule.status;
+      add(rule);
+    }
+    for (const port of entry.ports) {
+      const auto = this.settings.autoForward && !this.settings.ignorePorts.includes(port.port);
+      const enabled = (entry.detected.has(port.port) || auto) && !entry.suppressed.has(port.port);
+      add(makeRule(`detected:${entry.serverId}:${port.port}`, "detected", port.process, enabled,
+        localTunnel(port.port, port.connectHost.replace(/^\[|\]$/g, ""), port.port), true));
+    }
+    entry.rules = rules;
+    entry.revision++;
+    // Detach immediately, including while a forward is waiting for readiness.
+    for (const [key, instance] of entry.instances) {
+      for (const [id, expected] of instance.refs) {
+        const rule = rules.get(id);
+        if (!rule?.enabled || signature(rule) !== expected) instance.refs.delete(id);
+      }
+      if (!instance.refs.size) {
+        entry.instances.delete(key);
+        this.cancelInstance(entry, instance);
+      }
+    }
+    this.projectInstances(entry);
+  }
+
+  private cancelInstance(entry: HostEntry, instance: Instance): void {
+    const session = entry.session;
+    if (!session) return;
+    const closing = session.cancelRule(instance.tunnel).catch((error) => this.log(`[port-forward] cancel: ${message(error)}`));
+    entry.closing.add(closing);
+    void closing.finally(() => entry.closing.delete(closing));
+  }
+
+  private projectInstances(entry: HostEntry): void {
+    for (const rule of entry.rules.values()) {
+      rule.sharedWith = [];
+      if (!rule.enabled) { rule.status = "stopped"; rule.error = null; rule.actualPort = null; rule.portConflict = false; }
+      const own = [...entry.instances.values()].find((instance) => instance.refs.has(rule.id));
+      if (own) {
+        rule.actualPort = own.tunnel.listenPort;
+        rule.status = own.status;
+        rule.error = own.error;
+        rule.portConflict = own.portConflict;
+        rule.sharedWith = [...own.refs.keys()].filter((id) => id !== rule.id);
+      } else if (!rule.enabled && rule.tunnel) {
+        const shared = entry.instances.get(tunnelKey(rule.tunnel));
+        if (shared?.status === "active") rule.sharedWith = [...shared.refs.keys()];
       }
     }
   }
 
-  private scan(entry: HostEntry, force = false): Promise<void> {
-    const freshFor = entry.scanError ? ERROR_RETRY_MS : SCAN_FRESH_MS;
-    if (!force && entry.scannedAt && Date.now() - entry.scannedAt < freshFor) {
-      return Promise.resolve();
+  private synchronize(entry: HostEntry): Promise<void> {
+    if (entry.syncing) return entry.syncing;
+    const pending = (async () => {
+      if (this.disposed || !entry.ssh.target) return;
+      await this.ensureConnected(entry);
+      let revision: number;
+      do {
+        revision = entry.revision;
+        await Promise.all([...entry.closing]);
+        for (const rule of entry.rules.values()) {
+          if (!rule.enabled || !rule.tunnel || rule.status === "error") continue;
+          if ([...entry.instances.values()].some((instance) => instance.refs.has(rule.id))) continue;
+          await this.startRule(entry, rule);
+        }
+      } while (revision !== entry.revision && !this.disposed && entry.session?.running);
+      this.projectInstances(entry);
+    })();
+    entry.syncing = pending.finally(() => { entry.syncing = null; });
+    return entry.syncing;
+  }
+
+  private async startRule(entry: HostEntry, rule: Rule): Promise<void> {
+    const session = entry.session;
+    const requested = rule.tunnel!;
+    let port = rule.actualPort ?? requested.listenPort;
+    if (rule.automatic && port < 1024) port += 1024;
+    const limit = Math.min(port + (rule.automatic ? 100 : 0), 65535);
+    for (; port <= limit; port++) {
+      if (entry.rules.get(rule.id) !== rule || !rule.enabled || entry.session !== session || !session?.running) return;
+      const tunnel = { ...requested, listenPort: port };
+      const key = tunnelKey(tunnel);
+      const shared = entry.instances.get(key);
+      if (shared) {
+        shared.refs.set(rule.id, signature(rule));
+        this.projectInstances(entry);
+        return;
+      }
+      if (rule.automatic && !await isLocalPortFree(port)) continue;
+      const instance: Instance = { tunnel, refs: new Map([[rule.id, signature(rule)]]), status: "connecting", error: null, portConflict: false };
+      entry.instances.set(key, instance);
+      rule.status = "connecting";
+      rule.actualPort = port;
+      try {
+        await session.forwardRule(tunnel);
+        if (entry.instances.get(key) !== instance || !instance.refs.size || entry.session !== session) {
+          await session.cancelRule(tunnel);
+          return;
+        }
+        instance.status = "active";
+        this.projectInstances(entry);
+        return;
+      } catch (error) {
+        if (entry.instances.get(key) !== instance) return;
+        entry.instances.delete(key);
+        const conflict = /address already in use|only one usage of each socket address/i.test(message(error));
+        if (rule.automatic && conflict) continue;
+        for (const id of instance.refs.keys()) {
+          const current = entry.rules.get(id);
+          if (current?.enabled) { current.status = "error"; current.error = message(error); current.portConflict = conflict; }
+        }
+        return;
+      }
     }
+    rule.status = "error";
+    rule.error = "No available local port within the next 100 ports";
+    rule.portConflict = true;
+  }
+
+  private async scan(entry: HostEntry): Promise<void> {
     if (entry.scanning) return entry.scanning;
-    entry.scanning = (async () => {
+    if (entry.scannedAt && Date.now() - entry.scannedAt < (entry.scanError ? 5000 : 1500)) return;
+    const pending = (async () => {
       try {
         await this.ensureConnected(entry);
-        const output = await entry.session!.exec(SCAN_SCRIPT);
-        const raw = parseScanOutput(output);
+        const session = entry.session!;
+        const raw = parseScanOutput(await session.exec(SCAN_SCRIPT));
+        if (entry.session !== session) return;
         if (!raw.complete) throw new Error("Port scan output was truncated");
         const result = analyzeScan(raw);
-        entry.ssh = { ...entry.ssh, remoteServerId: result.pidFile?.serverId ?? null };
-        if (!result.pidFile) {
-          throw new Error("No Paseo daemon found on the remote (~/.paseo/paseo.pid is missing)");
-        }
-        if (result.pidFile.serverId && result.pidFile.serverId !== entry.serverId) {
-          entry.ports = [];
-          throw new Error(
-            `SSH target is Paseo host ${result.pidFile.serverId}, not ${entry.serverId}. ` +
-              "Check the SSH target for this host.",
-          );
-        }
+        if (result.pidFile?.serverId !== entry.serverId) throw new Error("Remote Paseo identity changed");
         entry.ports = result.ports;
         entry.scanError = null;
-        await this.pruneClosed(entry);
-      } catch (error) {
-        entry.scanError = message(error);
-      } finally {
-        entry.scannedAt = Date.now();
-        entry.scanning = null;
-      }
+        const open = new Set(entry.ports.map((port) => port.port));
+        for (const port of entry.detected) if (!open.has(port)) entry.detected.delete(port);
+        for (const port of entry.suppressed) if (!open.has(port)) entry.suppressed.delete(port);
+        this.updateRules(entry);
+        await this.synchronize(entry);
+      } catch (error) { entry.scanError = message(error); }
+      finally { entry.scannedAt = Date.now(); }
     })();
+    entry.scanning = pending.finally(() => { entry.scanning = null; });
     return entry.scanning;
-  }
-
-  /** Drop forwards, manual or auto, whose remote port no longer listens. Only after a good scan. */
-  private async pruneClosed(entry: HostEntry): Promise<void> {
-    const open = new Set(entry.ports.map((port) => port.port));
-    for (const forward of [...entry.forwards.values()]) {
-      if (open.has(forward.remotePort)) continue;
-      this.log(`[port-forward] ${entry.serverId}: remote port ${forward.remotePort} closed`);
-      await this.unforward(entry.serverId, forward.remotePort);
-    }
-  }
-
-  private verified(entry: HostEntry): boolean {
-    return entry.ssh.remoteServerId === entry.serverId;
   }
 
   async state(serverId: string): Promise<PortsState> {
     const entry = this.entry(serverId);
     entry.lastTouched = Date.now();
     if (entry.ssh.target) {
-      // The first call waits for a result; later ones answer from the last scan and refresh behind.
-      const pending = this.scan(entry);
-      if (entry.scannedAt === null || entry.ssh.state === "idle") await pending;
+      if (entry.scannedAt === null) await this.scan(entry);
+      else void this.scan(entry);
     }
     return snapshot(entry);
   }
 
-  async forward(serverId: string, remotePort: number, auto = false): Promise<Forward> {
+  async forward(serverId: string, remotePort: number, _auto = false): Promise<Forward> {
     const entry = this.entry(serverId);
-    entry.lastTouched = Date.now();
-    const existing = entry.forwards.get(remotePort);
-    if (existing?.status === "active") return { ...existing };
-    await this.scan(entry, true);
-    if (!this.verified(entry)) {
-      throw new Error(entry.scanError ?? "The remote host's identity could not be verified");
-    }
-    const port = entry.ports.find((candidate) => candidate.port === remotePort);
-    const connectHost = port?.connectHost ?? existing?.connectHost ?? "127.0.0.1";
-    const taken = new Set<number>();
-    for (const host of this.hosts.values()) {
-      for (const forward of host.forwards.values()) taken.add(forward.localPort);
-    }
-    if (existing) taken.delete(existing.localPort);
-    const localPort = existing?.localPort ?? (await pickLocalPort(remotePort, taken));
-    const forward: Forward = {
-      serverId,
-      remotePort,
-      connectHost,
-      localPort,
-      status: "active",
-      error: null,
-      auto,
-    };
-    try {
-      await entry.session!.forward(localPort, connectHost, remotePort);
-    } catch (error) {
-      forward.status = "error";
-      forward.error = message(error);
-      if (!existing) throw error;
-    }
-    entry.forwards.set(remotePort, forward);
-    this.log(
-      `[port-forward] ${serverId}: localhost:${localPort} → ${connectHost}:${remotePort}${auto ? " (auto)" : ""}`,
-    );
-    return { ...forward };
+    entry.detected.add(remotePort);
+    entry.suppressed.delete(remotePort);
+    this.updateRules(entry);
+    const id = `detected:${serverId}:${remotePort}`;
+    await this.retryRule(serverId, id);
+    const rule = entry.rules.get(id);
+    if (!rule?.tunnel) throw new Error("Port is no longer detected; use Add port instead");
+    return { serverId, remotePort, connectHost: rule.tunnel.connectHost, localPort: rule.actualPort ?? rule.tunnel.listenPort,
+      status: rule.status === "active" ? "active" : "error", error: rule.error, auto: false };
   }
 
   async unforward(serverId: string, remotePort: number): Promise<boolean> {
-    const entry = this.hosts.get(serverId);
-    const forward = entry?.forwards.get(remotePort);
-    if (!entry || !forward) return false;
-    entry.forwards.delete(remotePort);
-    if (entry.session?.running) {
-      await entry.session
-        .cancel(forward.localPort, forward.connectHost, forward.remotePort)
-        .catch((error: unknown) => this.log(`[port-forward] cancel failed: ${message(error)}`));
-    }
-    this.log(`[port-forward] ${serverId}: stopped localhost:${forward.localPort}`);
+    const entry = this.entry(serverId);
+    entry.detected.delete(remotePort);
+    entry.suppressed.add(remotePort);
+    this.updateRules(entry);
+    await Promise.all([...entry.closing]);
     return true;
   }
 
-  async testConnection(
-    serverId: string,
-    target?: string,
-  ): Promise<{ ok: boolean; remoteServerId: string | null; error: string | null }> {
-    const resolved = target?.trim() || this.settings.targets[serverId]?.trim();
+  async retryRule(serverId: string, ruleId: string): Promise<PortsState> {
+    const entry = this.entry(serverId);
+    const rule = entry.rules.get(ruleId);
+    if (!rule) throw new Error("Rule no longer exists; refresh the list");
+    if (rule.enabled && rule.tunnel) {
+      const existing = [...entry.instances.entries()].find(([, instance]) => instance.refs.has(ruleId));
+      if (existing?.[1].status === "error") {
+        entry.instances.delete(existing[0]);
+        for (const id of existing[1].refs.keys()) {
+          const shared = entry.rules.get(id);
+          if (shared) { shared.status = "stopped"; shared.error = null; }
+        }
+      }
+      rule.status = "stopped";
+      rule.error = null;
+      rule.portConflict = false;
+    }
+    await this.synchronize(entry);
+    return snapshot(entry);
+  }
+
+  async availablePort(serverId: string, ruleId: string): Promise<number> {
+    const rule = this.entry(serverId).rules.get(ruleId);
+    if (!rule?.tunnel || rule.tunnel.direction !== "local" || !rule.portConflict) throw new Error("A local port conflict is required");
+    const tunnel = rule.tunnel;
+    const bind = effectiveBind(tunnel);
+    const hosts = bind === "*" || bind === "" ? ["0.0.0.0", "::"] : bind === "localhost" ? ["127.0.0.1", "::1"] : [bind];
+    const probes = hosts.filter((host) => tunnel.addressFamily === "any" || (host.includes(":") ? tunnel.addressFamily === "inet6" : tunnel.addressFamily === "inet"));
+    for (let port = Math.max(tunnel.listenPort, 1024); port <= Math.min(Math.max(tunnel.listenPort, 1024) + 100, 65535); port++) {
+      if ((await Promise.all(probes.map((host) => isLocalPortFree(port, host)))).every(Boolean)) return port;
+    }
+    throw new Error("No available local port within the next 100 ports");
+  }
+
+  async refreshConfig(serverId: string): Promise<PortsState> {
+    const entry = this.entry(serverId);
+    if (!entry.ssh.target) throw new Error("No SSH target configured");
+    const target = entry.ssh.target;
+    try {
+      const configuration = await readSshConfiguration(target);
+      if (entry.ssh.target !== target || this.disposed) throw new Error("SSH target changed");
+      if (configuration.fingerprint !== entry.configuration?.fingerprint) await this.closeSession(entry);
+      entry.configuration = configuration;
+      entry.configError = null;
+      this.updateRules(entry);
+      await this.synchronize(entry);
+    } catch (error) { entry.configError = message(error); }
+    return snapshot(entry);
+  }
+
+  async testConnection(serverId: string, target?: string): Promise<{ ok: boolean; remoteServerId: string | null; error: string | null }> {
+    const resolved = target?.trim() || this.settings.targets[serverId];
     if (!resolved) return { ok: false, remoteServerId: null, error: "No SSH target configured" };
     const session = new HostSession(`${serverId}-test`, resolved);
     try {
       await session.start();
-      const raw = parseScanOutput(await session.exec(SCAN_SCRIPT));
-      const remoteServerId = raw.pidFile?.serverId ?? null;
-      if (!raw.pidFile) {
-        return { ok: false, remoteServerId, error: "Connected, but no Paseo daemon was found there" };
-      }
-      if (remoteServerId !== serverId) {
-        return {
-          ok: false,
-          remoteServerId,
-          error: `Connected, but that machine is Paseo host ${remoteServerId}, not ${serverId}`,
-        };
-      }
-      return { ok: true, remoteServerId, error: null };
-    } catch (error) {
-      return { ok: false, remoteServerId: null, error: message(error) };
-    } finally {
-      await session.stop();
-    }
+      const remoteServerId = parsePidFile(await session.exec(IDENTITY_SCRIPT))?.serverId ?? null;
+      return { ok: remoteServerId === serverId, remoteServerId,
+        error: remoteServerId === serverId ? null : `Connected to Paseo host ${remoteServerId}, expected ${serverId}` };
+    } catch (error) { return { ok: false, remoteServerId: null, error: message(error) }; }
+    finally { await session.stop(); }
   }
 
-  /** Background scan, whether or not the Ports screen is open. */
-  private scheduleTick(): void {
-    if (this.autoTimer) clearInterval(this.autoTimer);
-    this.autoTimer = null;
-    if (this.disposed) return;
-    this.autoTimer = setInterval(() => void this.tick(), this.settings.pollSeconds * 1000);
-  }
-
-  /**
-   * Every host with forwards is rescanned so closed remote ports drop their forward (see
-   * `pruneClosed`); with auto-forward on, every host with a target is scanned and new ports
-   * are forwarded.
-   */
   private async tick(): Promise<void> {
-    if (this.ticking || this.disposed) return;
-    this.ticking = true;
-    try {
-      const auto = this.settings.autoForward;
-      const ignore = new Set(this.settings.ignorePorts);
-      const serverIds = new Set([...this.hosts.values()].filter((e) => e.forwards.size > 0).map((e) => e.serverId));
-      if (auto) {
-        for (const [serverId, target] of Object.entries(this.settings.targets)) {
-          if (target.trim()) serverIds.add(serverId);
-        }
-      }
-      for (const serverId of serverIds) {
-        const entry = this.entry(serverId);
-        // A dropped master is the reconnect timer's job; don't spawn ssh here for manual-only hosts.
-        if (!auto && !entry.session?.running) continue;
-        await this.scan(entry);
-        if (!auto || !this.verified(entry) || entry.scanError) continue;
-        for (const port of entry.ports) {
-          if (ignore.has(port.port) || entry.forwards.has(port.port)) continue;
-          await this.forward(serverId, port.port, true).catch((error: unknown) =>
-            this.log(`[port-forward] auto-forward of ${port.port} failed: ${message(error)}`),
-          );
-        }
-      }
-    } finally {
-      this.ticking = false;
-    }
-  }
-
-  private async reapIdle(): Promise<void> {
-    const now = Date.now();
     for (const entry of this.hosts.values()) {
-      if (!entry.session?.running || entry.forwards.size > 0 || this.settings.autoForward) continue;
-      if (now - entry.lastTouched < IDLE_MS) continue;
-      this.log(`[port-forward] closing idle connection for ${entry.serverId}`);
-      await this.closeHost(entry, "idle");
+      if (!entry.ssh.target || entry.reconnectTimer || !entry.session?.running) continue;
+      if (![...entry.rules.values()].some((rule) => rule.enabled) && !this.settings.autoForward && Date.now() - entry.lastTouched > 120_000) {
+        await this.closeSession(entry);
+      } else await this.scan(entry);
     }
   }
 
-  private async closeHost(entry: HostEntry, state: SshStatus["state"]): Promise<void> {
+  private async closeSession(entry: HostEntry): Promise<void> {
+    entry.generation++;
+    entry.revision++;
     if (entry.reconnectTimer) clearTimeout(entry.reconnectTimer);
     entry.reconnectTimer = null;
     const session = entry.session;
     entry.session = null;
-    if (session) {
-      for (const forward of entry.forwards.values()) {
-        await session
-          .cancel(forward.localPort, forward.connectHost, forward.remotePort)
-          .catch(() => {});
-      }
-      await session.stop();
-    }
-    entry.forwards.clear();
-    entry.ports = [];
+    entry.instances.clear();
+    entry.ssh.state = entry.ssh.target ? "idle" : "unmapped";
+    entry.ssh.remoteServerId = null;
     entry.scannedAt = null;
-    entry.ssh = { ...entry.ssh, state, error: null, remoteServerId: null };
+    for (const rule of entry.rules.values()) if (rule.tunnel) { rule.status = "stopped"; rule.error = null; }
+    if (session) await session.stop();
+    await Promise.allSettled([entry.syncing, entry.connecting].filter(Boolean));
   }
 
   async dispose(): Promise<void> {
     this.disposed = true;
-    for (const timer of this.timers) clearInterval(timer);
-    if (this.autoTimer) clearInterval(this.autoTimer);
-    await Promise.all([...this.hosts.values()].map((entry) => this.closeHost(entry, "idle")));
+    clearInterval(this.timer);
+    await Promise.all([...this.hosts.values()].map((entry) => this.closeSession(entry)));
     this.hosts.clear();
   }
 
-  /** For process exit, where nothing async runs. */
   killAll(): void {
+    this.disposed = true;
+    clearInterval(this.timer);
     for (const entry of this.hosts.values()) entry.session?.killNow();
   }
 }
 
+function localTunnel(port: number, host: string, remote: number): Tunnel {
+  return { direction: "local", bindAddress: "127.0.0.1", listenPort: port,
+    connectHost: host, connectPort: remote, gatewayPorts: false, addressFamily: "any" };
+}
+function makeRule(id: string, source: Rule["source"], name: string, enabled: boolean, tunnel: Tunnel | null, automatic: boolean): Rule {
+  return { id, source, name, enabled, tunnel, automatic, requestedPort: tunnel?.listenPort ?? null,
+    raw: null, actualPort: null, status: "stopped", error: null, sharedWith: [], portConflict: false };
+}
+function signature(rule: Rule): string { return JSON.stringify([rule.tunnel, rule.enabled, rule.automatic]); }
 function snapshot(entry: HostEntry): PortsState {
-  return {
-    ssh: { ...entry.ssh },
-    ports: entry.ports.map((port) => ({ ...port })),
-    forwards: [...entry.forwards.values()].map((forward) => ({ ...forward })),
+  return { ssh: { ...entry.ssh }, ports: entry.ports.map((port) => ({ ...port })), forwards: [],
+    rules: [...entry.rules.values()].map((rule) => ({ ...rule, sharedWith: [...rule.sharedWith] })),
     scannedAt: entry.scannedAt ? new Date(entry.scannedAt).toISOString() : null,
-    scanError: entry.scanError,
-  };
+    scanError: entry.scanError, configError: entry.configError };
 }
-
-function message(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
+function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }

@@ -6,6 +6,9 @@ import {
   stateRpc,
   testConnectionRpc,
   unforwardRpc,
+  refreshConfigRpc,
+  retryRuleRpc,
+  availablePortRpc,
 } from "./shared/contracts";
 import { portSettings } from "./shared/settings";
 import { PortManager } from "./server/manager";
@@ -43,6 +46,18 @@ export default function contribute(server: PluginServerContext) {
   server.handle(testConnectionRpc, async ({ serverId, target }) => {
     await ready;
     return manager.testConnection(serverId, target);
+  });
+  server.handle(refreshConfigRpc, async ({ serverId }) => {
+    await ready;
+    return manager.refreshConfig(serverId);
+  });
+  server.handle(retryRuleRpc, async ({ serverId, ruleId }) => {
+    await ready;
+    return manager.retryRule(serverId, ruleId);
+  });
+  server.handle(availablePortRpc, async ({ serverId, ruleId }) => {
+    await ready;
+    return { port: await manager.availablePort(serverId, ruleId) };
   });
 
   // The plugin process can die without running cleanup; never leave ssh masters behind.
