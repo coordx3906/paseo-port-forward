@@ -24,6 +24,7 @@ process.stdin.on("end", () => server.close());
       "-o", "ConnectTimeout=10", target!, command], { windowsHide: true });
     const exited = once(fixture, "close");
     const session = new WindowsHostSession("integration", target!);
+    const remoteNode = (script: string) => session.exec(`node <<'JS'\n${script}\nJS`);
     const localHttp = createServer((_request, response) => response.end("paseo-reverse-ok"));
     try {
       const remotePort = await new Promise<number>((resolve, reject) => {
@@ -48,23 +49,36 @@ process.stdin.on("end", () => server.close());
 
       await new Promise<void>((resolve) => localHttp.listen(0, "127.0.0.1", resolve));
       const localHttpPort = (localHttp.address() as { port: number }).port;
-      const reversePort = Number((await session.exec("python3 -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\",0)); print(s.getsockname()[1]); s.close()'")).trim());
+      const reversePort = Number((await remoteNode(`
+const server = require("node:net").createServer();
+server.listen(0, "127.0.0.1", () => {
+  const port = server.address().port;
+  server.close(() => console.log(port));
+});
+`)).trim());
       const reverse: Tunnel = { direction: "remote", bindAddress: "127.0.0.1", listenPort: reversePort,
         connectHost: "127.0.0.1", connectPort: localHttpPort, gatewayPorts: false, addressFamily: "any" };
       await session.forwardRule(reverse);
-      const response = await session.exec(`python3 -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:${reversePort}", timeout=5).read().decode())'`);
+      const response = await remoteNode(`
+const request = require("node:http").get("http://127.0.0.1:${reversePort}", response => {
+  response.pipe(process.stdout);
+});
+request.setTimeout(5000, () => request.destroy(new Error("HTTP request timed out")));
+`);
       expect(response.trim()).toBe("paseo-reverse-ok");
       await session.cancelRule(reverse);
-      const released = await session.exec(`python3 - <<'PY'
-import socket
-try:
-    connection = socket.create_connection(("127.0.0.1", ${reversePort}), timeout=5)
-except ConnectionRefusedError:
-    print("released")
-else:
-    connection.close()
-    print("still listening")
-PY`);
+      const released = await remoteNode(`
+const connection = require("node:net").connect(${reversePort}, "127.0.0.1");
+connection.once("connect", () => {
+  console.log("still listening");
+  connection.end();
+});
+connection.once("error", error => {
+  if (error.code !== "ECONNREFUSED") throw error;
+  console.log("released");
+});
+connection.setTimeout(5000, () => connection.destroy(new Error("Port probe timed out")));
+`);
       expect(released.trim()).toBe("released");
     } finally {
       await session.stop();

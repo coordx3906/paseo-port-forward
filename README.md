@@ -112,7 +112,8 @@ npm test
 ```
 
 On Windows, set `PASEO_SSH_TEST_TARGET` to a Linux SSH alias before `npm test` to
-include the integration test. It requires Python 3 on the remote, starts a temporary
+include the integration test. It uses Node on the remote (available as `node` on the
+SSH command's PATH), starts a temporary
 HTTP server in memory, and checks HTTP forwarding in both directions, cancellation
 and listener release without changing remote files or settings.
 
