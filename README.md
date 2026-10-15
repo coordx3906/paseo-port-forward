@@ -20,7 +20,7 @@ Settings → Plugins → **Port forwarding** has the SSH targets, auto-forward, 
 
 Requirements:
 - Paseo `>=0.11.1`.
-- A macOS or Linux laptop with OpenSSH.
+- A macOS, Linux or Windows laptop with OpenSSH (`ssh` on PATH).
 - Linux remotes.
 - Key- or agent-based SSH. `BatchMode=yes` is used, so password prompts and unknown host keys fail with an error instead of hanging. Connect once by hand to accept a new host key.
 
@@ -50,6 +50,17 @@ Laptop daemon
   - Stale control sockets are swept on start.
 - **Idle:** a master with no forwards closes after 2 minutes without the screen polling it.
 
+### Windows
+
+Windows uses OpenSSH without ControlMaster or a local Unix shell. It keeps one
+connection for the host and one per forwarded port; scans use separate SSH commands.
+A Node watchdog terminates SSH when the plugin's stdin pipe closes. If a persistent
+connection exits, the host reconnects and reapplies its forwards.
+
+The target's effective SSH configuration is resolved once per session, including
+ProxyJump hops, and inherited forwards are removed from plugin-created connections.
+Your SSH configuration is not edited.
+
 ## Phase 0 findings (Paseo 0.11.1)
 
 The plan in issue #1 assumed a workspace-panel tab. These are the answers to its open questions, read from the app bundle and checked against the running daemon:
@@ -74,6 +85,5 @@ npm test
 ## Limitations
 
 - Linux remotes only. macOS remotes would need `lsof` (planned).
-- Windows laptops are not supported: Windows OpenSSH has no ControlMaster.
 - No workspace tab (see Phase 0 above).
 - No password or interactive SSH authentication.
