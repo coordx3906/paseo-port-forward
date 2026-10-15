@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Tunnel } from "../shared/rules";
+import { tunnelKey, type Tunnel } from "../shared/rules";
 import { defaultPortSettings, type PortSettings } from "../shared/settings";
 
 const fake = vi.hoisted(() => ({
@@ -17,7 +17,11 @@ vi.mock("./ssh", () => ({ HostSession: class {
   async stop() { this.running = false; }
   killNow() { this.running = false; }
   onExit() { return () => {}; }
-  onForwardExit() { return () => {}; }
+  forwardExited!: (key: string, error: string) => void;
+  onForwardExit(listener: (key: string, error: string) => void) {
+    this.forwardExited = listener;
+    return () => {};
+  }
   async exec(script: string) {
     const pid = '{"pid":1,"serverId":"srv"}';
     return script.includes("@listen") ? `@pidfile\n${pid}\n@end\n` : pid;
@@ -42,9 +46,45 @@ beforeEach(() => {
   settings = { ...defaultPortSettings(), targets: { srv: "alias" } };
   manager = new PortManager(vi.fn());
 });
-afterEach(async () => { await manager.dispose(); });
+afterEach(async () => { await manager.dispose(); vi.useRealTimers(); });
 
 describe("rule ownership and failure isolation", () => {
+  it("reconnects a shared failed tunnel with backoff without restarting healthy forwards", async () => {
+    fake.configRules = [{ id: "config", tunnel, raw: "localforward", error: null }];
+    settings.manualRules = [manual, { ...manual, id: "healthy", localPort: 3001 }];
+    manager.applySettings(settings);
+    await manager.state("srv");
+    const session = fake.sessions[0];
+    vi.useFakeTimers();
+    fake.forward.mockRejectedValueOnce(new Error("Connection refused"));
+    session.forwardExited(tunnelKey(tunnel), "Connection reset");
+    expect((await manager.state("srv")).rules.find((rule) => rule.id === "manual")?.status).toBe("error");
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fake.forward).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(fake.forward).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(1);
+    const state = await manager.state("srv");
+    expect(fake.forward).toHaveBeenCalledTimes(4);
+    expect(fake.forward).toHaveBeenLastCalledWith(tunnel);
+    expect(fake.sessions).toHaveLength(1);
+    expect(state.rules.every((rule) => rule.status === "active")).toBe(true);
+    expect(state.rules.find((rule) => rule.id === "manual")?.sharedWith).toEqual([sshId]);
+    expect(fake.cancel).not.toHaveBeenCalled();
+  });
+
+  it("cancels a pending reconnect when its last source is removed", async () => {
+    settings.manualRules = [manual];
+    manager.applySettings(settings);
+    await manager.state("srv");
+    vi.useFakeTimers();
+    fake.sessions[0].forwardExited(tunnelKey(tunnel), "Connection reset");
+    manager.applySettings({ ...settings, manualRules: [] });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fake.forward).toHaveBeenCalledTimes(1);
+    expect((await manager.state("srv")).rules).toEqual([]);
+  });
+
   it("shares runtime only and closes it after the last enabled source leaves", async () => {
     fake.configRules = [{ id: "config", tunnel, raw: "localforward", error: null }];
     settings.manualRules = [manual];

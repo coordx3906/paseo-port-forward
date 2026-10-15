@@ -9,10 +9,9 @@ import { mkdirSync, readdirSync, rmSync, mkdtempSync, writeFileSync, rmdirSync }
 import { userInfo, tmpdir } from "node:os";
 import { join } from "node:path";
 import { WindowsHostSession } from "./windows-ssh";
-import { forwardSpec, runSsh, sshError, type RunResult } from "./ssh-command";
+import { runSsh, sshError, type RunResult } from "./ssh-command";
 import { readSshConfiguration, type SshConfiguration } from "./ssh-config";
 import { tunnelSpec, type Tunnel } from "../shared/rules";
-export { forwardSpec, runSsh, sshError, type RunResult } from "./ssh-command";
 
 const CONNECT_TIMEOUT_MS = 20_000;
 
@@ -175,22 +174,6 @@ class UnixHostSession {
       throw new Error(sshError(result, `remote command failed (${result.code})`));
     }
     return result.stdout;
-  }
-
-  async forward(localPort: number, connectHost: string, remotePort: number): Promise<void> {
-    const result = await this.control("forward", [
-      "-L",
-      forwardSpec(localPort, connectHost, remotePort),
-    ]);
-    if (result.code !== 0) throw new Error(sshError(result, "ssh refused the forward"));
-  }
-
-  async cancel(localPort: number, connectHost: string, remotePort: number): Promise<void> {
-    const result = await this.control("cancel", [
-      "-L",
-      forwardSpec(localPort, connectHost, remotePort),
-    ]);
-    if (result.code !== 0) throw new Error(sshError(result, "ssh refused to cancel the forward"));
   }
 
   async forwardRule(tunnel: Tunnel): Promise<void> {

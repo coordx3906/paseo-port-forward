@@ -131,10 +131,6 @@ export class WindowsHostSession {
     return result.stdout;
   }
 
-  async forward(localPort: number, connectHost: string, remotePort: number): Promise<void> {
-    return this.forwardRule(legacyTunnel(localPort, connectHost, remotePort));
-  }
-
   async forwardRule(tunnel: Tunnel): Promise<void> {
     const key = tunnelKey(tunnel);
     if (this.forwards.has(key)) return;
@@ -148,10 +144,6 @@ export class WindowsHostSession {
       throw error;
     }
     if (this.forwards.get(key) !== pending.child) throw new Error("Forward was cancelled");
-  }
-
-  async cancel(localPort: number, connectHost: string, remotePort: number): Promise<void> {
-    return this.cancelRule(legacyTunnel(localPort, connectHost, remotePort));
   }
 
   async cancelRule(tunnel: Tunnel): Promise<void> {
@@ -194,8 +186,3 @@ export class WindowsHostSession {
   }
 }
 
-function legacyTunnel(localPort: number, connectHost: string, remotePort: number): Tunnel {
-  return { direction: "local", bindAddress: "127.0.0.1", listenPort: localPort,
-    connectHost: connectHost.replace(/^\[|\]$/g, ""), connectPort: remotePort,
-    gatewayPorts: false, addressFamily: "any" };
-}

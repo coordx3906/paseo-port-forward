@@ -1,4 +1,4 @@
-import type { Forward, PortsState, RemotePort, SshStatus } from "../shared/contracts";
+import type { PortsState, RemotePort, SshStatus } from "../shared/contracts";
 import { defaultPortSettings, type PortSettings } from "../shared/settings";
 import { effectiveBind, tunnelKey, type Rule, type Tunnel } from "../shared/rules";
 import { isLocalPortFree } from "./local-port";
@@ -14,6 +14,8 @@ interface Instance {
   status: "connecting" | "active" | "error";
   error: string | null;
   portConflict: boolean;
+  reconnectTimer: NodeJS.Timeout | null;
+  backoffMs: number;
 }
 interface HostEntry {
   serverId: string;
@@ -125,6 +127,9 @@ export class PortManager {
         session.onExit((error) => {
           if (entry.session !== session || this.disposed) return;
           entry.session = null;
+          for (const instance of entry.instances.values()) {
+            if (instance.reconnectTimer) clearTimeout(instance.reconnectTimer);
+          }
           entry.instances.clear();
           this.hostError(entry, `Connection lost: ${error}`);
         });
@@ -134,6 +139,7 @@ export class PortManager {
           instance.status = "error";
           instance.error = error;
           this.projectInstances(entry);
+          this.reconnectInstance(entry, key, instance, session);
         });
         this.updateRules(entry);
         for (const rule of entry.rules.values()) if (rule.tunnel) { rule.status = "stopped"; rule.error = null; rule.portConflict = false; }
@@ -208,11 +214,37 @@ export class PortManager {
   }
 
   private cancelInstance(entry: HostEntry, instance: Instance): void {
+    if (instance.reconnectTimer) clearTimeout(instance.reconnectTimer);
     const session = entry.session;
     if (!session) return;
     const closing = session.cancelRule(instance.tunnel).catch((error) => this.log(`[port-forward] cancel: ${message(error)}`));
     entry.closing.add(closing);
     void closing.finally(() => entry.closing.delete(closing));
+  }
+
+  private reconnectInstance(entry: HostEntry, key: string, instance: Instance, session: HostSession): void {
+    if (this.disposed || entry.session !== session || entry.instances.get(key) !== instance || instance.reconnectTimer) return;
+    const delay = instance.backoffMs;
+    instance.backoffMs = Math.min(delay * 2, 30_000);
+    instance.reconnectTimer = setTimeout(async () => {
+      instance.reconnectTimer = null;
+      if (this.disposed || entry.session !== session || entry.instances.get(key) !== instance) return;
+      instance.status = "connecting";
+      instance.error = null;
+      this.projectInstances(entry);
+      try {
+        await session.forwardRule(instance.tunnel);
+        if (entry.session !== session || entry.instances.get(key) !== instance) return;
+        instance.status = "active";
+        instance.backoffMs = 1000;
+      } catch (error) {
+        if (entry.session !== session || entry.instances.get(key) !== instance) return;
+        instance.status = "error";
+        instance.error = message(error);
+        this.reconnectInstance(entry, key, instance, session);
+      }
+      this.projectInstances(entry);
+    }, delay);
   }
 
   private projectInstances(entry: HostEntry): void {
@@ -271,7 +303,8 @@ export class PortManager {
         return;
       }
       if (rule.automatic && !await isLocalPortFree(port)) continue;
-      const instance: Instance = { tunnel, refs: new Map([[rule.id, signature(rule)]]), status: "connecting", error: null, portConflict: false };
+      const instance: Instance = { tunnel, refs: new Map([[rule.id, signature(rule)]]), status: "connecting", error: null, portConflict: false,
+        reconnectTimer: null, backoffMs: 1000 };
       entry.instances.set(key, instance);
       rule.status = "connecting";
       rule.actualPort = port;
@@ -337,7 +370,7 @@ export class PortManager {
     return snapshot(entry);
   }
 
-  async forward(serverId: string, remotePort: number, _auto = false): Promise<Forward> {
+  async forward(serverId: string, remotePort: number): Promise<Rule> {
     const entry = this.entry(serverId);
     entry.detected.add(remotePort);
     entry.suppressed.delete(remotePort);
@@ -346,8 +379,7 @@ export class PortManager {
     await this.retryRule(serverId, id);
     const rule = entry.rules.get(id);
     if (!rule?.tunnel) throw new Error("Port is no longer detected; use Add port instead");
-    return { serverId, remotePort, connectHost: rule.tunnel.connectHost, localPort: rule.actualPort ?? rule.tunnel.listenPort,
-      status: rule.status === "active" ? "active" : "error", error: rule.error, auto: false };
+    return { ...rule, sharedWith: [...rule.sharedWith] };
   }
 
   async unforward(serverId: string, remotePort: number): Promise<boolean> {
@@ -366,6 +398,7 @@ export class PortManager {
     if (rule.enabled && rule.tunnel) {
       const existing = [...entry.instances.entries()].find(([, instance]) => instance.refs.has(ruleId));
       if (existing?.[1].status === "error") {
+        if (existing[1].reconnectTimer) clearTimeout(existing[1].reconnectTimer);
         entry.instances.delete(existing[0]);
         for (const id of existing[1].refs.keys()) {
           const shared = entry.rules.get(id);
@@ -438,6 +471,9 @@ export class PortManager {
     entry.reconnectTimer = null;
     const session = entry.session;
     entry.session = null;
+    for (const instance of entry.instances.values()) {
+      if (instance.reconnectTimer) clearTimeout(instance.reconnectTimer);
+    }
     entry.instances.clear();
     entry.ssh.state = entry.ssh.target ? "idle" : "unmapped";
     entry.ssh.remoteServerId = null;
@@ -457,7 +493,12 @@ export class PortManager {
   killAll(): void {
     this.disposed = true;
     clearInterval(this.timer);
-    for (const entry of this.hosts.values()) entry.session?.killNow();
+    for (const entry of this.hosts.values()) {
+      for (const instance of entry.instances.values()) {
+        if (instance.reconnectTimer) clearTimeout(instance.reconnectTimer);
+      }
+      entry.session?.killNow();
+    }
   }
 }
 
@@ -471,7 +512,7 @@ function makeRule(id: string, source: Rule["source"], name: string, enabled: boo
 }
 function signature(rule: Rule): string { return JSON.stringify([rule.tunnel, rule.enabled, rule.automatic]); }
 function snapshot(entry: HostEntry): PortsState {
-  return { ssh: { ...entry.ssh }, ports: entry.ports.map((port) => ({ ...port })), forwards: [],
+  return { ssh: { ...entry.ssh }, ports: entry.ports.map((port) => ({ ...port })),
     rules: [...entry.rules.values()].map((rule) => ({ ...rule, sharedWith: [...rule.sharedWith] })),
     scannedAt: entry.scannedAt ? new Date(entry.scannedAt).toISOString() : null,
     scanError: entry.scanError, configError: entry.configError };

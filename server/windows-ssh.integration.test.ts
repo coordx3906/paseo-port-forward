@@ -39,9 +39,11 @@ process.stdin.on("end", () => server.close());
       });
       await session.start();
       const localPort = await pickLocalPort(49152, new Set());
-      await session.forward(localPort, "127.0.0.1", remotePort);
+      const local: Tunnel = { direction: "local", bindAddress: "127.0.0.1", listenPort: localPort,
+        connectHost: "127.0.0.1", connectPort: remotePort, gatewayPorts: false, addressFamily: "any" };
+      await session.forwardRule(local);
       expect(await (await fetch(`http://127.0.0.1:${localPort}`)).text()).toBe("paseo-windows-ssh-ok");
-      await session.cancel(localPort, "127.0.0.1", remotePort);
+      await session.cancelRule(local);
       expect(await isLocalPortFree(localPort)).toBe(true);
 
       await new Promise<void>((resolve) => localHttp.listen(0, "127.0.0.1", resolve));

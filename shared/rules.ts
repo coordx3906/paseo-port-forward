@@ -47,3 +47,13 @@ export function tunnelSpec(tunnel: Tunnel): string {
   const address = (host: string) => host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
   return `${address(effectiveBind(tunnel))}:${tunnel.listenPort}:${address(tunnel.connectHost)}:${tunnel.connectPort}`;
 }
+
+export function localForwardUrl(rule: Rule): string | null {
+  const tunnel = rule.tunnel;
+  if (!tunnel || tunnel.direction !== "local" || rule.status !== "active") return null;
+  const bind = effectiveBind(tunnel);
+  if (!["127.0.0.1", "::1", "localhost", "*", "", "0.0.0.0", "::"].includes(bind)) return null;
+  const ipv6 = bind === "::1" || bind === "::"
+    || (["localhost", "*", ""].includes(bind) && tunnel.addressFamily === "inet6");
+  return `http://${ipv6 ? "[::1]" : "127.0.0.1"}:${rule.actualPort ?? tunnel.listenPort}`;
+}

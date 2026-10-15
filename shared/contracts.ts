@@ -25,21 +25,9 @@ export const RemotePortSchema = z.object({
 });
 export type RemotePort = z.infer<typeof RemotePortSchema>;
 
-export const ForwardSchema = z.object({
-  serverId: z.string(),
-  remotePort: z.number().int(),
-  connectHost: z.string(),
-  localPort: z.number().int(),
-  status: z.enum(["active", "error"]),
-  error: z.string().nullable(),
-  auto: z.boolean(),
-});
-export type Forward = z.infer<typeof ForwardSchema>;
-
 export const PortsStateSchema = z.object({
   ssh: SshStatusSchema,
   ports: z.array(RemotePortSchema),
-  forwards: z.array(ForwardSchema),
   scannedAt: z.string().nullable(),
   scanError: z.string().nullable(),
   rules: z.array(RuleSchema),
@@ -64,7 +52,7 @@ export const stateRpc = defineRpc({
 export const forwardRpc = defineRpc({
   name: "ports.forward",
   input: ServerInput.extend({ remotePort: z.number().int().min(1).max(65535) }),
-  output: ForwardSchema,
+  output: RuleSchema,
 });
 
 export const unforwardRpc = defineRpc({
