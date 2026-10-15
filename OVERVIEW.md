@@ -4,6 +4,8 @@ Install it on your laptop's daemon only. It opens its own SSH connection to each
 
 Setup: give each remote host an SSH target (`user@host` or a config alias). Before forwarding, the plugin checks that the machine it reaches reports the same Paseo `serverId`. Password prompts are not supported. Accept a new host key once by hand.
 
-Forwards bind to `127.0.0.1` only and use the same port number when it is free locally, otherwise the next free one. Auto-forward mode forwards new ports on every configured host, skips an ignore list (default 22, 5432, 6379), and removes the forward when the remote port closes. Disabling the plugin closes every forward and SSH connection.
+Detected and manually added forwards bind to `127.0.0.1`. Automatic local-port selection prefers the same port number and chooses another when occupied. Auto-forward mode forwards new detected ports on every configured host, skips an ignore list (default 22, 5432, 6379), and removes the detected source when the remote port closes. Disabling the plugin closes every forward and SSH connection.
 
-Requires Paseo 0.11.1 or later, a macOS, Linux or Windows laptop, and Linux remotes. Windows uses separate SSH connections instead of ControlMaster.
+Add ports manually for services outside Paseo, or use the target's static SSH LocalForward and RemoteForward rules, loaded automatically. Manual entries and per-rule disabled states survive plugin restarts. Imported rules retain their configured bind addresses. Rules fail independently; automatic local ports can move to an available port, while explicit ports show an error and can be changed in the plugin without editing your SSH config.
+
+Requires Paseo 0.11.1 or later, a macOS, Linux or Windows laptop with OpenSSH, and Linux remotes. Windows uses separate SSH connections instead of ControlMaster.

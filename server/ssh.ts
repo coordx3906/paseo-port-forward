@@ -5,14 +5,15 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readdirSync, rmSync } from "node:fs";
-import { userInfo } from "node:os";
+import { mkdirSync, readdirSync, rmSync, mkdtempSync, writeFileSync, rmdirSync } from "node:fs";
+import { userInfo, tmpdir } from "node:os";
 import { join } from "node:path";
+import { WindowsHostSession } from "./windows-ssh";
+import { runSsh, sshError, type RunResult } from "./ssh-command";
+import { readSshConfiguration, type SshConfiguration } from "./ssh-config";
+import { tunnelSpec, type Tunnel } from "../shared/rules";
 
 const CONNECT_TIMEOUT_MS = 20_000;
-import { WindowsHostSession } from "./windows-ssh";
-import { forwardSpec, runSsh, sshError, type RunResult } from "./ssh-command";
-export { forwardSpec, runSsh, sshError, type RunResult } from "./ssh-command";
 
 /** Short and outside $TMPDIR: unix socket paths are capped at ~104 bytes on macOS. */
 export function runtimeDir(): string {
@@ -58,10 +59,12 @@ class UnixHostSession {
   private stderr = "";
   private stopping = false;
   private exitListeners = new Set<(error: string) => void>();
+  private configDir: string | null = null;
 
   constructor(
     readonly serverId: string,
     readonly target: string,
+    private configuration?: SshConfiguration,
   ) {
     const hash = createHash("sha256").update(`${serverId}\0${target}`).digest("hex").slice(0, 16);
     this.socketPath = join(runtimeDir(), `${hash}.sock`);
@@ -76,11 +79,22 @@ class UnixHostSession {
     return () => this.exitListeners.delete(listener);
   }
 
+  // Mux requests report per-forward failures directly rather than killing the master.
+  onForwardExit(_listener: (key: string, error: string) => void): () => void { return () => {}; }
+
+  private get configArgs(): string[] {
+    return ["-F", join(this.configDir!, "config")];
+  }
+
   /** Start the master and resolve once it accepts mux commands. */
   async start(): Promise<void> {
     if (this.master) return;
     this.stopping = false;
     this.stderr = "";
+    const config = this.configuration ?? await readSshConfiguration(this.target);
+    if (this.stopping) throw new Error("SSH session was stopped");
+    this.configDir = mkdtempSync(join(tmpdir(), "paseo-pf-"));
+    writeFileSync(join(this.configDir, "config"), config.text, { mode: 0o600 });
     rmSync(this.socketPath, { force: true });
     const child = spawn(
       "sh",
@@ -88,6 +102,7 @@ class UnixHostSession {
         "-c",
         MASTER_WATCHDOG,
         "sh",
+        ...this.configArgs,
         "-M",
         "-S",
         this.socketPath,
@@ -121,6 +136,7 @@ class UnixHostSession {
       if (this.master !== child) return;
       this.master = null;
       rmSync(this.socketPath, { force: true });
+      this.removeConfig();
       if (!this.stopping) for (const listener of this.exitListeners) listener(error);
     });
 
@@ -143,7 +159,7 @@ class UnixHostSession {
   }
 
   private control(command: string, extra: string[] = []): Promise<RunResult> {
-    return runSsh(["-S", this.socketPath, "-O", command, ...extra, this.target], {
+    return runSsh([...this.configArgs, "-S", this.socketPath, "-O", command, ...extra, this.target], {
       timeoutMs: 5_000,
     });
   }
@@ -151,7 +167,7 @@ class UnixHostSession {
   /** Run a shell script on the remote through the master connection. */
   async exec(script: string): Promise<string> {
     const result = await runSsh(
-      ["-S", this.socketPath, "-o", "BatchMode=yes", this.target, "sh", "-s"],
+      [...this.configArgs, "-S", this.socketPath, "-o", "BatchMode=yes", this.target, "sh", "-s"],
       { input: script },
     );
     if (result.code !== 0 && !result.stdout) {
@@ -160,26 +176,20 @@ class UnixHostSession {
     return result.stdout;
   }
 
-  async forward(localPort: number, connectHost: string, remotePort: number): Promise<void> {
-    const result = await this.control("forward", [
-      "-L",
-      forwardSpec(localPort, connectHost, remotePort),
-    ]);
+  async forwardRule(tunnel: Tunnel): Promise<void> {
+    const result = await this.control("forward", [tunnel.direction === "local" ? "-L" : "-R", tunnelSpec(tunnel)]);
     if (result.code !== 0) throw new Error(sshError(result, "ssh refused the forward"));
   }
 
-  async cancel(localPort: number, connectHost: string, remotePort: number): Promise<void> {
-    const result = await this.control("cancel", [
-      "-L",
-      forwardSpec(localPort, connectHost, remotePort),
-    ]);
+  async cancelRule(tunnel: Tunnel): Promise<void> {
+    const result = await this.control("cancel", [tunnel.direction === "local" ? "-L" : "-R", tunnelSpec(tunnel)]);
     if (result.code !== 0) throw new Error(sshError(result, "ssh refused to cancel the forward"));
   }
 
   async stop(): Promise<void> {
     this.stopping = true;
     const child = this.master;
-    if (!child) return;
+    if (!child) { this.removeConfig(); return; }
     await this.control("exit");
     if (this.master === child) {
       child.kill("SIGTERM");
@@ -196,6 +206,7 @@ class UnixHostSession {
     }
     this.master = null;
     rmSync(this.socketPath, { force: true });
+    this.removeConfig();
   }
 
   /** Synchronous last resort for process exit. */
@@ -204,6 +215,14 @@ class UnixHostSession {
     this.master?.kill("SIGTERM");
     this.master = null;
     rmSync(this.socketPath, { force: true });
+    this.removeConfig();
+  }
+
+  private removeConfig(): void {
+    if (!this.configDir) return;
+    rmSync(join(this.configDir, "config"), { force: true });
+    rmdirSync(this.configDir);
+    this.configDir = null;
   }
 }
 

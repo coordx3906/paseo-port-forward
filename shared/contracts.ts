@@ -1,5 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
+import { RuleSchema, PortSchema } from "./rules";
 
 export const SshStatusSchema = z.object({
   state: z.enum(["unmapped", "idle", "connecting", "connected", "error"]),
@@ -24,23 +25,13 @@ export const RemotePortSchema = z.object({
 });
 export type RemotePort = z.infer<typeof RemotePortSchema>;
 
-export const ForwardSchema = z.object({
-  serverId: z.string(),
-  remotePort: z.number().int(),
-  connectHost: z.string(),
-  localPort: z.number().int(),
-  status: z.enum(["active", "error"]),
-  error: z.string().nullable(),
-  auto: z.boolean(),
-});
-export type Forward = z.infer<typeof ForwardSchema>;
-
 export const PortsStateSchema = z.object({
   ssh: SshStatusSchema,
   ports: z.array(RemotePortSchema),
-  forwards: z.array(ForwardSchema),
   scannedAt: z.string().nullable(),
   scanError: z.string().nullable(),
+  rules: z.array(RuleSchema),
+  configError: z.string().nullable(),
 });
 export type PortsState = z.infer<typeof PortsStateSchema>;
 
@@ -61,7 +52,7 @@ export const stateRpc = defineRpc({
 export const forwardRpc = defineRpc({
   name: "ports.forward",
   input: ServerInput.extend({ remotePort: z.number().int().min(1).max(65535) }),
-  output: ForwardSchema,
+  output: RuleSchema,
 });
 
 export const unforwardRpc = defineRpc({
@@ -78,4 +69,16 @@ export const testConnectionRpc = defineRpc({
     remoteServerId: z.string().nullable(),
     error: z.string().nullable(),
   }),
+});
+
+export const refreshConfigRpc = defineRpc({
+  name: "ports.refresh-config", input: ServerInput, output: PortsStateSchema,
+});
+export const retryRuleRpc = defineRpc({
+  name: "ports.retry-rule",
+  input: ServerInput.extend({ ruleId: z.string().min(1) }), output: PortsStateSchema,
+});
+export const availablePortRpc = defineRpc({
+  name: "ports.available-port",
+  input: ServerInput.extend({ ruleId: z.string().min(1) }), output: z.object({ port: PortSchema }),
 });

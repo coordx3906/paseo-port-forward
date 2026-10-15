@@ -1,12 +1,12 @@
 import { createServer } from "node:net";
 
 /** True when nothing on this machine is listening on 127.0.0.1:`port`. */
-export function isLocalPortFree(port: number): Promise<boolean> {
+export function isLocalPortFree(port: number, host = "127.0.0.1"): Promise<boolean> {
   return new Promise((resolve) => {
     const server = createServer();
     server.unref();
     server.once("error", () => resolve(false));
-    server.listen({ host: "127.0.0.1", port, exclusive: true }, () => {
+    server.listen({ host, port, exclusive: true, ipv6Only: host.includes(":") }, () => {
       server.close(() => resolve(true));
     });
   });

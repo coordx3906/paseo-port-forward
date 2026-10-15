@@ -10,6 +10,10 @@ vi.mock("./ssh-command", async (original) => ({
 }));
 
 import { WindowsHostSession } from "./windows-ssh";
+import type { Tunnel } from "../shared/rules";
+
+const mapping: Tunnel = { direction: "local", bindAddress: "127.0.0.1", listenPort: 3000,
+  connectHost: "127.0.0.1", connectPort: 3000, gatewayPorts: false, addressFamily: "any" };
 
 async function spawnReady() { await vi.waitFor(() => expect(spawn).toHaveBeenCalled()); }
 
@@ -40,7 +44,7 @@ describe("Windows SSH sessions", () => {
     host.stdout.write("forward-ready\r\n");
     await starting;
     expect(session.running).toBe(true);
-    const forwarding = session.forward(3001, "127.0.0.1", 3000);
+    const forwarding = session.forwardRule({ ...mapping, listenPort: 3001 });
     const args = JSON.parse(spawn.mock.calls[1]![1][2]);
     expect(args).toContain("127.0.0.1:3001:127.0.0.1:3000");
     expect(args).toContain("ControlMaster=no");
@@ -51,7 +55,7 @@ describe("Windows SSH sessions", () => {
     expect(spawn.mock.calls[1]![2]).toMatchObject({ windowsHide: true });
     tunnel.stdout.write("paseo-port-forward-ready\n");
     await forwarding;
-    await session.cancel(3001, "127.0.0.1", 3000);
+    await session.cancelRule({ ...mapping, listenPort: 3001 });
     expect(tunnel.stdin.writableEnded).toBe(true);
     expect(host.stdin.writableEnded).toBe(false);
     await session.stop();
@@ -71,6 +75,30 @@ describe("Windows SSH sessions", () => {
     expect(session.running).toBe(false);
   });
 
+  it("isolates a failed forward from the host and notifies only its rule", async () => {
+    const host = child();
+    const tunnel = child();
+    spawn.mockReturnValueOnce(host).mockReturnValueOnce(tunnel);
+    const session = new WindowsHostSession("host", "my-alias");
+    const starting = session.start();
+    await spawnReady();
+    host.stdout.write("paseo-port-forward-ready\n");
+    await starting;
+    const exited = vi.fn();
+    const forwardExited = vi.fn();
+    session.onExit(exited);
+    session.onForwardExit(forwardExited);
+    const forwarding = session.forwardRule(mapping);
+    tunnel.stdout.write("paseo-port-forward-ready\n");
+    await forwarding;
+    tunnel.emit("close", 255);
+    expect(exited).not.toHaveBeenCalled();
+    expect(forwardExited).toHaveBeenCalledOnce();
+    expect(host.stdin.writableEnded).toBe(false);
+    expect(session.running).toBe(true);
+    await session.stop();
+  });
+
   it("rejects a failed bind without tearing down the host connection", async () => {
     const host = child();
     const tunnel = child();
@@ -80,7 +108,7 @@ describe("Windows SSH sessions", () => {
     await spawnReady();
     host.stdout.write("paseo-port-forward-ready\n");
     await starting;
-    const forwarding = session.forward(3000, "127.0.0.1", 3000);
+    const forwarding = session.forwardRule(mapping);
     tunnel.stderr.write("Could not request local forwarding.\n");
     tunnel.emit("close", 255);
     await expect(forwarding).rejects.toThrow("Could not request local forwarding.");
@@ -97,9 +125,9 @@ describe("Windows SSH sessions", () => {
     await spawnReady();
     host.stdout.write("paseo-port-forward-ready\n");
     await starting;
-    const forwarding = session.forward(3000, "127.0.0.1", 3000);
+    const forwarding = session.forwardRule(mapping);
     const rejected = expect(forwarding).rejects.toThrow("Forward was cancelled");
-    const cancelling = session.cancel(3000, "127.0.0.1", 3000);
+    const cancelling = session.cancelRule(mapping);
     tunnel.stdout.write("paseo-port-forward-ready\n");
     await cancelling;
     await rejected;

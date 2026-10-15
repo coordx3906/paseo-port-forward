@@ -11,7 +11,9 @@ export function usePortSettings() {
   const update = useCallback(
     async (patch: (current: PortSettings) => PortSettings) => {
       if (!values || revision === null) return false;
-      return state.save(patch(values), revision);
+      const saved = await state.save(patch(values), revision);
+      if (!saved) throw new Error("Settings changed elsewhere. Refresh and try again.");
+      return saved;
     },
     [state, values, revision],
   );

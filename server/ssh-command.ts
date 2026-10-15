@@ -42,6 +42,3 @@ export function sshError(result: RunResult, fallback: string): string {
   return lines.at(-1) ?? fallback;
 }
 
-export function forwardSpec(localPort: number, connectHost: string, remotePort: number): string {
-  return `127.0.0.1:${localPort}:${connectHost}:${remotePort}`;
-}
