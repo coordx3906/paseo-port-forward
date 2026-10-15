@@ -200,6 +200,12 @@ function TargetForm({
   );
 }
 
+type RuleAction = "toggle" | "retry" | "delete" | "choose" | "reset" | "edit" | "port";
+type PortOperation =
+  | { action: "refresh"; rule?: never }
+  | { action: "port"; rule: Rule; port: number }
+  | { action: Exclude<RuleAction, "edit" | "port">; rule: Rule };
+
 function PortList({
   serverId,
   styles,
@@ -236,20 +242,13 @@ function PortList({
   const [portEditor, setPortEditor] = useState<Rule | null>(null);
 
   const operation = useMutation({
-    mutationFn: async ({
-      rule,
-      action,
-      port,
-    }: {
-      rule?: Rule;
-      action: string;
-      port?: number;
-    }) => {
-      if (action === "refresh") {
+    mutationFn: async (operation: PortOperation) => {
+      if (operation.action === "refresh") {
         await refresh({ serverId });
         return;
       }
-      if (!rule) return;
+      const { rule, action } = operation;
+      let port = operation.action === "port" ? operation.port : undefined;
       if (action === "retry") {
         await retry({ serverId, ruleId: rule.id });
         return;
@@ -470,7 +469,7 @@ function RuleRow({
   busy: boolean;
   process?: PortsState["ports"][number];
   agentTitles?: Record<string, string | null | undefined>;
-  onAction(action: string): void;
+  onAction(action: RuleAction): void;
 }) {
   const tunnel = rule.tunnel;
   const local = tunnel?.direction === "local";

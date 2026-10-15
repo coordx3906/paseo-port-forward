@@ -1,22 +1,38 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { tunnelKey, type Tunnel } from "../shared/rules";
 import { defaultPortSettings, type PortSettings } from "../shared/settings";
+import type { ConfigRule } from "./ssh-config";
+
+interface SessionStub {
+  running: boolean;
+  target: string;
+  forwarded: Tunnel[];
+  exited: (error: string) => void;
+  forwardExited: (key: string, error: string) => void;
+}
 
 const fake = vi.hoisted(() => ({
-  sessions: [] as any[], configRules: [] as any[],
-  forward: vi.fn(), cancel: vi.fn(), free: vi.fn(),
+  sessions: [] as SessionStub[], configRules: [] as ConfigRule[],
+  forward: vi.fn<(tunnel: Tunnel) => Promise<void>>(),
+  cancel: vi.fn<(tunnel: Tunnel) => Promise<void>>(),
+  free: vi.fn<(port: number, host?: string) => Promise<boolean>>(),
 }));
 vi.mock("./local-port", () => ({ isLocalPortFree: fake.free }));
 vi.mock("./ssh-config", () => ({ readSshConfiguration: vi.fn(async () => ({
   text: "", fingerprint: "same", rules: fake.configRules,
 })) }));
-vi.mock("./ssh", () => ({ HostSession: class {
+vi.mock("./ssh", () => ({ HostSession: class implements SessionStub {
   running = false;
-  constructor() { fake.sessions.push(this); }
+  forwarded: Tunnel[] = [];
+  constructor(_serverId: string, readonly target: string) { fake.sessions.push(this); }
   async start() { this.running = true; }
   async stop() { this.running = false; }
   killNow() { this.running = false; }
-  onExit() { return () => {}; }
+  exited!: (error: string) => void;
+  onExit(listener: (error: string) => void) {
+    this.exited = listener;
+    return () => {};
+  }
   forwardExited!: (key: string, error: string) => void;
   onForwardExit(listener: (key: string, error: string) => void) {
     this.forwardExited = listener;
@@ -26,7 +42,7 @@ vi.mock("./ssh", () => ({ HostSession: class {
     const pid = '{"pid":1,"serverId":"srv"}';
     return script.includes("@listen") ? `@pidfile\n${pid}\n@end\n` : pid;
   }
-  forwardRule(tunnel: Tunnel) { return fake.forward(tunnel); }
+  forwardRule(tunnel: Tunnel) { this.forwarded.push(tunnel); return fake.forward(tunnel); }
   cancelRule(tunnel: Tunnel) { return fake.cancel(tunnel); }
 } }));
 import { PortManager } from "./manager";
@@ -49,12 +65,51 @@ beforeEach(() => {
 afterEach(async () => { await manager.dispose(); vi.useRealTimers(); });
 
 describe("rule ownership and failure isolation", () => {
+  it.each(["stop", "delete", "change target"] as const)(
+    "does not start the old rule after %s during automatic port selection",
+    async (action) => {
+      let available!: (free: boolean) => void;
+      fake.free.mockImplementationOnce(() => new Promise<boolean>((resolve) => { available = resolve; }));
+      settings.manualRules = [{ ...manual, localPort: null }];
+      manager.applySettings(settings);
+      await vi.waitFor(() => expect(fake.free).toHaveBeenCalledTimes(1));
+      const oldSession = fake.sessions[0]!;
+      settings = action === "change target"
+        ? { ...settings, targets: { srv: "new-alias" } }
+        : { ...settings, manualRules: action === "delete" ? [] : [{ ...manual, localPort: null, enabled: false }] };
+      manager.applySettings(settings);
+      available(true);
+      await manager.state("srv");
+      if (action === "change target") {
+        await vi.waitFor(() => expect(fake.sessions.find((session) => session.target === "new-alias")?.forwarded).toHaveLength(1));
+        expect(oldSession.running).toBe(false);
+      }
+      expect(oldSession.forwarded).toEqual([]);
+    },
+  );
+
+  it("reconnects a lost host connection and reapplies its forwards", async () => {
+    settings.manualRules = [manual];
+    manager.applySettings(settings);
+    await manager.state("srv");
+    const oldSession = fake.sessions[0]!;
+    vi.useFakeTimers();
+    oldSession.running = false;
+    oldSession.exited("Connection reset");
+    await vi.advanceTimersByTimeAsync(1000);
+    const state = await manager.state("srv");
+    expect(fake.sessions).toHaveLength(2);
+    expect(fake.sessions[1]!.forwarded).toEqual([tunnel]);
+    expect(state.ssh.state).toBe("connected");
+    expect(state.rules[0]?.status).toBe("active");
+  });
+
   it("reconnects a shared failed tunnel with backoff without restarting healthy forwards", async () => {
     fake.configRules = [{ id: "config", tunnel, raw: "localforward", error: null }];
     settings.manualRules = [manual, { ...manual, id: "healthy", localPort: 3001 }];
     manager.applySettings(settings);
     await manager.state("srv");
-    const session = fake.sessions[0];
+    const session = fake.sessions[0]!;
     vi.useFakeTimers();
     fake.forward.mockRejectedValueOnce(new Error("Connection refused"));
     session.forwardExited(tunnelKey(tunnel), "Connection reset");
@@ -78,7 +133,7 @@ describe("rule ownership and failure isolation", () => {
     manager.applySettings(settings);
     await manager.state("srv");
     vi.useFakeTimers();
-    fake.sessions[0].forwardExited(tunnelKey(tunnel), "Connection reset");
+    fake.sessions[0]!.forwardExited(tunnelKey(tunnel), "Connection reset");
     manager.applySettings({ ...settings, manualRules: [] });
     await vi.advanceTimersByTimeAsync(1000);
     expect(fake.forward).toHaveBeenCalledTimes(1);

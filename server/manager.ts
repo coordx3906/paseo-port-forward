@@ -303,6 +303,7 @@ export class PortManager {
         return;
       }
       if (rule.automatic && !await isLocalPortFree(port)) continue;
+      if (entry.rules.get(rule.id) !== rule || !rule.enabled || entry.session !== session || !session.running) return;
       const instance: Instance = { tunnel, refs: new Map([[rule.id, signature(rule)]]), status: "connecting", error: null, portConflict: false,
         reconnectTimer: null, backoffMs: 1000 };
       entry.instances.set(key, instance);
