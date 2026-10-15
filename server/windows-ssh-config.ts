@@ -3,7 +3,12 @@ export function connectionConfig(output: string, host = "*"): string {
   const lines = output.split(/\r?\n/).filter((line) =>
     line && !/^(host|localforward|remoteforward|dynamicforward|clearallforwardings|controlmaster|controlpath|controlpersist|forkafterauthentication|sessiontype|remotecommand|requesttty|exitonforwardfailure)\s/i.test(line),
   );
-  return `Host ${JSON.stringify(host)}\nClearAllForwardings no\n` + lines.map((line) => {
+  // ssh -G emits one assignment per line; ssh_config uses only the first SetEnv directive.
+  const environment = lines.filter((line) => line.startsWith("setenv "))
+    .map((line) => JSON.stringify(line.slice("setenv ".length)));
+  return `Host ${JSON.stringify(host)}\nClearAllForwardings no\n`
+    + (environment.length ? `SetEnv ${environment.join(" ")}\n` : "")
+    + lines.filter((line) => !line.startsWith("setenv ")).map((line) => {
     const space = line.indexOf(" ");
     const key = line.slice(0, space);
     const value = line.slice(space + 1);
