@@ -174,7 +174,7 @@ export function parseScanOutput(output: string): RawScan {
   let section = "";
   let pidFileText = "";
   let proc: ProcInfo | null = null;
-  for (const line of output.split("\n")) {
+  for (const line of output.split(/\r?\n/)) {
     if (line.startsWith("@")) {
       const [name, arg] = line.slice(1).split(" ");
       section = name ?? "";

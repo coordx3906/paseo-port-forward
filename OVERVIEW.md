@@ -6,4 +6,4 @@ Setup: give each remote host an SSH target (`user@host` or a config alias). Befo
 
 Forwards bind to `127.0.0.1` only and use the same port number when it is free locally, otherwise the next free one. Auto-forward mode forwards new ports on every configured host, skips an ignore list (default 22, 5432, 6379), and removes the forward when the remote port closes. Disabling the plugin closes every forward and SSH connection.
 
-Requires Paseo 0.11.1 or later, a macOS or Linux laptop, and Linux remotes.
+Requires Paseo 0.11.1 or later, a macOS, Linux or Windows laptop, and Linux remotes. Windows uses separate SSH connections instead of ControlMaster.

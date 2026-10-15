@@ -10,7 +10,9 @@ import { userInfo } from "node:os";
 import { join } from "node:path";
 
 const CONNECT_TIMEOUT_MS = 20_000;
-const COMMAND_TIMEOUT_MS = 15_000;
+import { WindowsHostSession } from "./windows-ssh";
+import { forwardSpec, runSsh, sshError, type RunResult } from "./ssh-command";
+export { forwardSpec, runSsh, sshError, type RunResult } from "./ssh-command";
 
 /** Short and outside $TMPDIR: unix socket paths are capped at ~104 bytes on macOS. */
 export function runtimeDir(): string {
@@ -36,54 +38,9 @@ kill "$w" 2>/dev/null
 exit "$s"
 `;
 
-export interface RunResult {
-  code: number | null;
-  stdout: string;
-  stderr: string;
-}
-
-export function runSsh(
-  args: string[],
-  options: { input?: string; timeoutMs?: number } = {},
-): Promise<RunResult> {
-  return new Promise((resolve) => {
-    const child = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => {
-      stderr += "\nssh command timed out";
-      child.kill("SIGKILL");
-    }, options.timeoutMs ?? COMMAND_TIMEOUT_MS);
-    child.stdout.setEncoding("utf8").on("data", (chunk: string) => (stdout += chunk));
-    child.stderr.setEncoding("utf8").on("data", (chunk: string) => (stderr += chunk));
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      resolve({ code: null, stdout, stderr: stderr + error.message });
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({ code, stdout, stderr });
-    });
-    child.stdin.on("error", () => {});
-    child.stdin.end(options.input ?? "");
-  });
-}
-
-/** Last meaningful stderr line, for the UI. */
-export function sshError(result: RunResult, fallback: string): string {
-  const lines = result.stderr
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line && !line.startsWith("Warning: Permanently added"));
-  return lines.at(-1) ?? fallback;
-}
-
-export function forwardSpec(localPort: number, connectHost: string, remotePort: number): string {
-  return `127.0.0.1:${localPort}:${connectHost}:${remotePort}`;
-}
-
 /** Close masters a crashed plugin process left behind. */
 export async function sweepStaleSockets(): Promise<void> {
+  if (process.platform === "win32") return;
   const dir = runtimeDir();
   const sockets = readdirSync(dir).filter((name) => name.endsWith(".sock"));
   await Promise.all(
@@ -95,7 +52,7 @@ export async function sweepStaleSockets(): Promise<void> {
   );
 }
 
-export class HostSession {
+class UnixHostSession {
   readonly socketPath: string;
   private master: ChildProcess | null = null;
   private stderr = "";
@@ -249,3 +206,6 @@ export class HostSession {
     rmSync(this.socketPath, { force: true });
   }
 }
+
+export const HostSession = process.platform === "win32" ? WindowsHostSession : UnixHostSession;
+export type HostSession = UnixHostSession | WindowsHostSession;
