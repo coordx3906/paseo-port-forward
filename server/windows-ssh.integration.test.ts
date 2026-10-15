@@ -9,21 +9,15 @@ const target = process.env.PASEO_SSH_TEST_TARGET;
 describe.skipIf(!target || process.platform !== "win32")("Windows OpenSSH integration", () => {
   it("forwards HTTP and releases the listener when cancelled", async () => {
     // No remote files or settings are changed. The fixture exits on SSH stdin EOF.
-    const python = `
-import http.server, threading, sys
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b'paseo-windows-ssh-ok')
-    def log_message(self, *args): pass
-server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
-threading.Thread(target=server.serve_forever, daemon=True).start()
-print(server.server_port, flush=True)
-sys.stdin.read()
-server.shutdown()
+    const script = `
+const server = require("node:http").createServer((_request, response) => {
+  response.end("paseo-windows-ssh-ok");
+});
+server.listen(0, "127.0.0.1", () => console.log(server.address().port));
+process.stdin.resume();
+process.stdin.on("end", () => server.close());
 `;
-    const command = "python3 -u -c '" + python.replaceAll("'", "'\\''") + "'";
+    const command = `node -e '${script}'`;
     const fixture = spawn("ssh", ["-T", "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes",
       "-o", "ConnectTimeout=10", target!, command], { windowsHide: true });
     const exited = once(fixture, "close");
